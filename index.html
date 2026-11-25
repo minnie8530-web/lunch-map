@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>午餐地圖｜南京復興</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #1e2a2d;
+    --paper: #f6f7f4;
+    --bar: #1d4e5a;
+    --bar-text: #f6f7f4;
+    --muted: #5b6b6f;
+    --warn-bg: #fff4d6;
+    --warn-text: #5c4400;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    color: var(--ink); background: var(--paper);
+  }
+  header {
+    background: var(--bar); color: var(--bar-text);
+    padding: 12px 16px; padding-top: max(12px, env(safe-area-inset-top));
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 1.15rem; font-weight: 700; }
+  header p { margin: 0; font-size: 0.875rem; opacity: 0.85; }
+  #notice {
+    display: none; padding: 8px 16px; font-size: 0.875rem;
+    background: var(--warn-bg); color: var(--warn-text);
+  }
+  #map { flex: 1; min-height: 0; }
+  .info { max-width: 220px; line-height: 1.5; color: var(--ink); }
+  .info strong { display: block; font-size: 1rem; }
+  .info span { color: var(--muted); font-size: 0.875rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>午餐地圖</h1>
+  <p id="subtitle">南京復興站周邊</p>
+</header>
+<div id="notice" role="status"></div>
+<div id="map" aria-label="午餐地圖"></div>
+
+<script>
+/* ---------- 設定：只需要改這三個地方 ---------- */
+const MAPS_API_KEY = "AIzaSyB5DvnQidB-X1zV7Gh7j-qIyBlKLXfFnCw";
+// 試算表「發布到網路」的 CSV 網址。留空 = 使用下面 3 個寫死的標記
+const SHEET_CSV_URL = "";
+const CENTER = { lat: 25.0520, lng: 121.5455 }; // 南京復興站周邊（松山區）
+const ZOOM = 16;
+
+/* ---------- 寫死的 3 個標記（階段一） ---------- */
+const HARDCODED_SHOPS = [
+  { name: "金福越式河粉 台北慶城店", cuisine: "越式", lat: 25.052685, lng: 121.546841 },
+  { name: "睡男孩-握飯糰",           cuisine: "日式", lat: 25.053148, lng: 121.547395 },
+  { name: "碰麵麵食館（南京店）",     cuisine: "中式", lat: 25.050026, lng: 121.544900 }
+];
+
+const $ = (id) => document.getElementById(id);
+
+function showNotice(text) {
+  const el = $("notice");
+  el.textContent = text;
+  el.style.display = "block";
+}
+
+/* 把 CSV 文字轉成二維陣列（支援引號與欄位內的逗號） */
+function parseCSV(text) {
+  const rows = []; let row = [], cell = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") { row.push(cell); cell = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell); rows.push(row); row = []; cell = "";
+    } else cell += c;
+  }
+  if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+/* 從試算表 CSV 讀取店家：用標題列的欄位代號找欄位 */
+async function loadShopsFromSheet(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const rows = parseCSV(await res.text());
+  const head = rows[0].map((h) => h.trim());
+  const col = (k) => head.indexOf(k);
+  const [iName, iCuisine, iLat, iLng] = ["name", "cuisine", "lat", "lng"].map(col);
+  if ([iName, iCuisine, iLat, iLng].includes(-1)) throw new Error("找不到 name / cuisine / lat / lng 欄位");
+  return rows.slice(1)
+    .map((r) => ({ name: (r[iName] || "").trim(), cuisine: (r[iCuisine] || "").trim(),
+                   lat: parseFloat(r[iLat]), lng: parseFloat(r[iLng]) }))
+    .filter((s) => s.name && Number.isFinite(s.lat) && Number.isFinite(s.lng));
+}
+
+/* 資訊視窗內容：用 DOM 組合，避免試算表內容被當成 HTML 執行 */
+function infoContent(shop) {
+  const box = document.createElement("div");
+  box.className = "info";
+  const name = document.createElement("strong");
+  name.textContent = shop.name;
+  const type = document.createElement("span");
+  type.textContent = shop.cuisine || "類型未填";
+  box.append(name, type);
+  return box;
+}
+
+async function initMap() {
+  const { Map, InfoWindow } = await google.maps.importLibrary("maps");
+  const { AdvancedMarkerElement } = await google.maps.importLibrary("marker");
+
+  const map = new Map($("map"), {
+    center: CENTER, zoom: ZOOM,
+    mapId: "DEMO_MAP_ID",           // 示範用地圖 ID，標記需要它
+    mapTypeControl: false, streetViewControl: false, fullscreenControl: false
+  });
+
+  let shops = HARDCODED_SHOPS;
+  if (SHEET_CSV_URL) {
+    try {
+      shops = await loadShopsFromSheet(SHEET_CSV_URL);
+    } catch (err) {
+      console.error(err);
+      showNotice("讀不到試算表，先顯示 3 家範例店家。請檢查 SHEET_CSV_URL（" + err.message + "）");
+    }
+  }
+  $("subtitle").textContent = "南京復興站周邊 · " + shops.length + " 家店";
+
+  const infoWindow = new InfoWindow();
+  shops.forEach((shop) => {
+    const marker = new AdvancedMarkerElement({
+      map, position: { lat: shop.lat, lng: shop.lng }, title: shop.name
+    });
+    marker.addListener("click", () => {
+      infoWindow.setContent(infoContent(shop));
+      infoWindow.open({ map, anchor: marker });
+    });
+  });
+}
+
+/* Key 錯誤或網域不在白名單時，Google 會呼叫這個函式 */
+window.gm_authFailure = () =>
+  showNotice("Google 地圖金鑰無法使用：請確認金鑰已貼上，並已允許這個網址使用。");
+
+function loadMaps() {
+  if (!MAPS_API_KEY || MAPS_API_KEY.startsWith("把你的")) {
+    showNotice("還沒設定金鑰：請把 Maps Demo Key 貼到 index.html 最上方的 MAPS_API_KEY。");
+    return;
+  }
+  const s = document.createElement("script");
+  s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(MAPS_API_KEY) +
+          "&v=weekly&loading=async&callback=initMap";
+  s.async = true;
+  document.head.appendChild(s);
+}
+window.initMap = initMap;
+loadMaps();
+</script>
+</body>
+</html>
